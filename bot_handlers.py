@@ -392,31 +392,26 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gracefully stops the application and triggers a container restart (exit code 1)."""
-    
+    """Signals supervisor to perform a fresh restart instantly."""
     if update.callback_query:
         await update.callback_query.answer("Restarting...")
         message_context = update.callback_query.message
     else:
         message_context = update.message
         
-    await message_context.reply_text("🔄 Restarting service now...")
+    await message_context.reply_text("⚡️ Fast Restart initiated...")
     
-    # --- NEW: Stop all running jobs ---
-    logger.info(f"Stopping {len(active_online_jobs)} online jobs...")
-    for user_id in list(active_online_jobs.keys()):
-        stop_online_job(user_id)
-    # --- End ---
+    # 1. Kill jobs instantly
+    active_online_jobs.clear() 
     
+    # 2. Fire-and-forget stop for clients (don't wait for them)
     if active_userbots:
-        logger.info(f"Stopping {len(active_userbots)} userbot clients before restart...")
-        stop_tasks = [client.stop() for client in active_userbots.values() if client.is_connected]
-        await asyncio.gather(*stop_tasks, return_exceptions=True)
-        active_userbots.clear()
-        
-    logger.info("Triggering application shutdown.")
-    await context.application.stop_running() 
+        for client in active_userbots.values():
+            if client.is_connected:
+                asyncio.create_task(client.stop())
     
+    # 3. Exit IMMEDIATELY (Supervisor catches code 1 and restarts instantly)
+    # This triggers the supervisor to clean cache and reboot
     sys.exit(1)
 
 

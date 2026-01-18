@@ -12,9 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Explicitly install/upgrade pyroblack AND tgcrypto
 RUN pip install -U pyroblack tgcrypto
 
-# Copy ALL files (main.py, config.py, utils.py, device_win11, etc.)
-# from the current directory into the container's /app directory.
+# Copy ALL files (main.py, config.py, utils.py, device_win11, supervisor.py, etc.)
 COPY . .
 
-# Command to run your bot when the container starts
-CMD ["python", "main.py"]
+# Command to run your bot via the supervisor
+CMD ["python", "supervisor.py"]

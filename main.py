@@ -1,5 +1,7 @@
 import asyncio
 import math 
+import time
+import sys
 from functools import partial
 from telegram import Update
 from telegram.ext import (
@@ -37,6 +39,14 @@ async def do_nothing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Dummy handler for /init_abc to avoid 'command not found' logs if user types it."""
     return
 
+async def health_heartbeat(context: ContextTypes.DEFAULT_TYPE):
+    """Updates heartbeat fast (every 5s) for instant hang detection."""
+    try:
+        with open("bot_heartbeat.tmp", "w") as f:
+            f.write(str(time.time()))
+    except Exception as e:
+        logger.error(f"Heartbeat failed: {e}")
+
 async def post_init_tasks(application: Application):
     """
     Called after the bot has started.
@@ -45,10 +55,13 @@ async def post_init_tasks(application: Application):
     await application.bot.get_me()
     logger.info(f"Management bot @{application.bot.username} started.")
     
-    # Start Userbots
+    # Start Userbots (Fast Parallel Start)
     await start_all_userbots_from_db(application)
     
-    logger.info("Bot is now running. Press Ctrl-C to stop.")
+    # Start Heartbeat Job (Fast: 5 seconds)
+    application.job_queue.run_repeating(health_heartbeat, interval=5, first=0)
+    
+    logger.info("Bot is now running with ZERO DELAY architecture.")
 
 async def post_shutdown_tasks(application: Application):
     """
@@ -56,6 +69,7 @@ async def post_shutdown_tasks(application: Application):
     Gracefully stops all userbots.
     """
     logger.info("Shutting down userbots...")
+    # Fire and forget stops to exit faster
     stop_tasks = [client.stop() for client in active_userbots.values() if client.is_connected]
     if stop_tasks:
         await asyncio.gather(*stop_tasks, return_exceptions=True)
@@ -118,7 +132,8 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input), group=1)
     
     logger.info("Bot is starting...")
-    application.run_polling(poll_interval=0.5, allowed_updates=Update.ALL_TYPES)
+    # Polling interval reduced to 0.1 for high responsiveness
+    application.run_polling(poll_interval=0.1, allowed_updates=Update.ALL_TYPES)
         
 
 if __name__ == "__main__":
@@ -134,8 +149,8 @@ if __name__ == "__main__":
             logger.info("Bot stopped manually.")
         except SystemExit as e:
             if e.code == 1:
-                # Docker restart policy will restart the container
-                logger.info("SystemExit(1) received, triggering container restart.")
+                # Docker/Supervisor will handle restart
+                logger.info("SystemExit(1) received, supervisor will restart.")
                 raise 
             else:
                 logger.info("SystemExit received. Exiting gracefully.")

@@ -32,6 +32,8 @@ from utils import generate_device_name, escape_html, sanitize_unique_name, encry
 # This ensures only ONE bot performs the heavy stop/start action at a time.
 # This is critical for preventing VPS crashes.
 online_action_sem = asyncio.Semaphore(1)
+# Throttles initial connections to prevent VPS crashes, but processes queue instantly
+connection_lock = asyncio.Semaphore(1) 
 
 # --- Keep-alive Job Management ---
 active_online_jobs = {}
@@ -53,8 +55,9 @@ async def perform_online_action(context: dict):
         try:
             # 1. Check connection
             if not client.is_connected:
-                logger.warning(f"Client {user_id_log} not connected. Attempting to start...")
-                await client.start() 
+                async with connection_lock:
+                    logger.warning(f"Client {user_id_log} not connected. Attempting to start...")
+                    await client.start() 
             
             # 2. Perform online action
             try:
@@ -73,11 +76,12 @@ async def perform_online_action(context: dict):
             await client.stop()
             logger.info(f"[{user_id_log}] Stopped (Offline state).")
 
-            # Wait 3 seconds WHILE offline
-            await asyncio.sleep(3)
+            # Minimal buffer for API sync (0.5s is safe minimum)
+            await asyncio.sleep(0.5)
 
             # 4. Connect back again
-            await client.start()
+            async with connection_lock:
+                await client.start()
             
             # 5. Re-add the forwarder handler (Memory Leak Fix)
             old_handler = context.job.data.get('current_handler')
@@ -100,15 +104,13 @@ async def perform_online_action(context: dict):
             
             logger.info(f"[{user_id_log}] Restarted and handler re-added.")
             
-            # Add a small buffer delay to let CPU cool down before releasing lock
-            await asyncio.sleep(2)
-
         except Exception as e:
             logger.warning(f"Failed to perform online action cycle for {user_id_log}: {e}")
             if not client.is_connected:
                 try:
                     logger.info(f"Attempting recovery restart for {user_id_log}...")
-                    await client.start()
+                    async with connection_lock:
+                        await client.start()
                     
                     # Recovery: Re-add handler
                     handler_with_context = partial(forwarder_handler, ptb_app=ptb_app)
@@ -150,7 +152,7 @@ async def schedule_online_job(client: Client, interval_str: str, ptb_app: Applic
     job_context = {'client': client, 'ptb_app': ptb_app, 'current_handler': None}
     
     # Randomize start time to further spread load
-    random_first_start = random.randint(30, 300) 
+    random_first_start = random.randint(5, 60) # Faster first run
 
     job = ptb_app.job_queue.run_repeating(
         perform_online_action,
@@ -305,7 +307,10 @@ async def start_userbot(
 
     error_detail = "An unknown error occurred."
     try:
-        await client.start()
+        # ZERO DELAY: Only wait for the lock, then start instantly. No sleep.
+        async with connection_lock:
+            await client.start()
+        
         me = await client.get_me()
         
         # 4. ROBUST EXISTING CHECK
@@ -387,6 +392,8 @@ async def start_userbot(
         # 8. DB Update with Duplicate Handling
         if update_info:
             if accounts_collection is not None:
+                # Run DB update in background (fire and forget) to speed up startup
+                # We calculate variables before the async call
                 existing_interval = "1440"
                 existing_otp_destroy = True
                 if account_doc:
@@ -397,26 +404,12 @@ async def start_userbot(
                 account_info["online_interval"] = existing_interval
                 account_info["otp_destroy_enabled"] = existing_otp_destroy
                 
-                try:
-                    accounts_collection.update_one(
-                        {"user_id": me.id}, 
-                        {"$set": account_info}, 
-                        upsert=True
-                    )
-                except DuplicateKeyError as e:
-                    # If we still hit a duplicate key (race condition), handle it
-                    logger.error(f"Duplicate Key Error on upsert for {me.id}: {e}")
-                    
-                    # If the error is on unique_name, force a rename and retry once
-                    if "unique_name" in str(e):
-                        safe_name = f"user{me.id}_{random.randint(10,99)}"
-                        account_info["unique_name"] = safe_name
-                        logger.info(f"Retrying upsert with fallback name: {safe_name}")
-                        accounts_collection.update_one(
-                            {"user_id": me.id}, 
-                            {"$set": account_info}, 
-                            upsert=True
-                        )
+                # Use asyncio.create_task to not block the return
+                asyncio.create_task(asyncio.to_thread(
+                    perform_db_update, 
+                    me.id, 
+                    account_info
+                ))
         
         final_interval_str = "1440"
         if 'online_interval' in account_info:
@@ -445,6 +438,28 @@ async def start_userbot(
             if not (me and me.id in active_userbots):
                 await client.stop()
 
+def perform_db_update(user_id, account_info):
+    """Helper to run DB update in thread."""
+    try:
+        accounts_collection.update_one(
+            {"user_id": user_id}, 
+            {"$set": account_info}, 
+            upsert=True
+        )
+    except DuplicateKeyError as e:
+        # If we still hit a duplicate key (race condition), handle it
+        logger.error(f"Duplicate Key Error on upsert for {user_id}: {e}")
+        # If the error is on unique_name, force a rename and retry once
+        if "unique_name" in str(e):
+            safe_name = f"user{user_id}_{random.randint(10,99)}"
+            account_info["unique_name"] = safe_name
+            logger.info(f"Retrying upsert with fallback name: {safe_name}")
+            accounts_collection.update_one(
+                {"user_id": user_id}, 
+                {"$set": account_info}, 
+                upsert=True
+            )
+
 async def start_all_userbots_from_db(
     application: Application, 
     update_info: bool = False
@@ -457,6 +472,9 @@ async def start_all_userbots_from_db(
     success_count = 0
     error_details = []
     
+    # Create tasks for all bots to start in parallel (throttled by the semaphore inside start_userbot)
+    tasks = []
+    
     for account in all_accounts:
         raw_session = account.get("session_string", "")
         # DECRYPT BEFORE USING
@@ -467,17 +485,24 @@ async def start_all_userbots_from_db(
         
         if not session_str: continue
         
-        status, _, detail = await start_userbot(
+        tasks.append(start_userbot(
             session_str, 
             application, 
             update_info=update_info,
             unique_name=unique_name,
             device_model_to_use=device_model 
-        )
+        ))
+
+    # Run all starts concurrently. The connection_lock will ensure they don't crash the VPS
+    # but there is no artificial sleep between them anymore.
+    results = await asyncio.gather(*tasks)
+
+    for i, (status, _, detail) in enumerate(results):
         if status == "success":
             success_count += 1
         else:
-            acc_id = unique_name or account.get('first_name') or account.get('user_id') or f"...{session_str[-4:]}"
+            acc = all_accounts[i]
+            acc_id = acc.get('unique_name') or acc.get('first_name') or acc.get('user_id')
             error_details.append(f"• <b>{escape_html(acc_id)}:</b> {escape_html(detail)}")
 
     logger.info(f"Started {success_count}/{len(all_accounts)} userbots from DB.")
