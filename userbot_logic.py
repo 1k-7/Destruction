@@ -42,48 +42,47 @@ async def perform_online_action(context: dict):
     """
     Job callback to send/delete message, wait 10s ONLINE, STOP, wait 3s OFFLINE,
     then START and RE-ADD THE OTP HANDLER.
-    
-    OPTIMIZED: Uses a Semaphore to prevent CPU spikes and fixes memory leaks.
     """
     client: Client = context.job.data['client']
     ptb_app: Application = context.job.data['ptb_app']
     
     user_id_log = client.me.id if client.me else "Unknown"
 
-    # --- THROTTLING: Wait for permission to run heavy tasks ---
-    async with online_action_sem:
-        try:
-            # 1. Check connection
+    try:
+        # --- PART 1: Connect and Send (Inside Semaphore) ---
+        async with online_action_sem:
             if not client.is_connected:
                 async with connection_lock:
                     logger.warning(f"Client {user_id_log} not connected. Attempting to start...")
-                    await client.start() 
+                    # Add timeout to prevent permanent lock freeze
+                    await asyncio.wait_for(client.start(), timeout=15.0)
             
-            # 2. Perform online action
             try:
-                msg = await client.send_message("me", f"Online action: {int(time.time())}")
+                # Add timeout to prevent hanging on dead sockets
+                msg = await asyncio.wait_for(client.send_message("me", f"Online action: {int(time.time())}"), timeout=10.0)
                 await msg.delete()
                 logger.info(f"[{user_id_log}] Online action (send/delete) done.")
             except Exception as e:
                 logger.warning(f"[{user_id_log}] Send/Delete failed: {e}")
 
-            # Wait 10 seconds while ONLINE
-            await asyncio.sleep(10)
+        # --- PART 2: Wait (OUTSIDE Semaphore to allow other bots to process) ---
+        await asyncio.sleep(10)
 
-            # 3. Go Offline (fully stop client)
-            # This is the heavy part. Since we are inside the Semaphore, 
-            # no other bot is doing this right now.
-            await client.stop()
+        # --- PART 3: Restart Cycle (Inside Semaphore) ---
+        async with online_action_sem:
+            try:
+                await asyncio.wait_for(client.stop(), timeout=10.0)
+            except Exception:
+                pass # Force continue if stop hangs
+            
             logger.info(f"[{user_id_log}] Stopped (Offline state).")
 
-            # Minimal buffer for API sync (0.5s is safe minimum)
             await asyncio.sleep(0.5)
 
-            # 4. Connect back again
             async with connection_lock:
-                await client.start()
+                await asyncio.wait_for(client.start(), timeout=15.0)
             
-            # 5. Re-add the forwarder handler (Memory Leak Fix)
+            # Re-add the forwarder handler
             old_handler = context.job.data.get('current_handler')
             if old_handler:
                 try:
@@ -104,25 +103,25 @@ async def perform_online_action(context: dict):
             
             logger.info(f"[{user_id_log}] Restarted and handler re-added.")
             
-        except Exception as e:
-            logger.warning(f"Failed to perform online action cycle for {user_id_log}: {e}")
-            if not client.is_connected:
-                try:
-                    logger.info(f"Attempting recovery restart for {user_id_log}...")
-                    async with connection_lock:
-                        await client.start()
-                    
-                    # Recovery: Re-add handler
-                    handler_with_context = partial(forwarder_handler, ptb_app=ptb_app)
-                    source_chat_id = await get_source_chat()
-                    new_handler = MessageHandler(handler_with_context, filters.chat(source_chat_id) & ~filters.service)
-                    client.add_handler(new_handler)
-                    context.job.data['current_handler'] = new_handler
-                except Exception as e2:
-                    logger.error(f"Recovery restart failed for {user_id_log}: {e2}")
+    except Exception as e:
+        logger.warning(f"Failed to perform online action cycle for {user_id_log}: {e}")
+        if not client.is_connected:
+            try:
+                logger.info(f"Attempting recovery restart for {user_id_log}...")
+                async with connection_lock:
+                    await asyncio.wait_for(client.start(), timeout=15.0)
+                
+                # Recovery: Re-add handler
+                handler_with_context = partial(forwarder_handler, ptb_app=ptb_app)
+                source_chat_id = await get_source_chat()
+                new_handler = MessageHandler(handler_with_context, filters.chat(source_chat_id) & ~filters.service)
+                client.add_handler(new_handler)
+                context.job.data['current_handler'] = new_handler
+            except Exception as e2:
+                logger.error(f"Recovery restart failed for {user_id_log}: {e2}")
 
-        finally:
-            gc.collect()
+    finally:
+        gc.collect()
 
 
 async def schedule_online_job(client: Client, interval_str: str, ptb_app: Application):
@@ -145,14 +144,12 @@ async def schedule_online_job(client: Client, interval_str: str, ptb_app: Applic
         logger.error(f"Invalid interval string '{interval_str}' for {user_id}. Defaulting to 1440min.")
         interval_seconds = 1440 * 60
 
-    if interval_seconds == 1440 * 60:
-        logger.info(f"Interval for {user_id} is default (1440). No online job scheduled.")
-        return
-
     job_context = {'client': client, 'ptb_app': ptb_app, 'current_handler': None}
     
-    # Randomize start time to further spread load
-    random_first_start = random.randint(5, 60) # Faster first run
+    # FIX: Spread the initial 200+ bot startup load over 15 minutes (900 seconds) 
+    # instead of jamming them all into the first 60 seconds.
+    max_delay = min(interval_seconds, 900) 
+    random_first_start = random.randint(5, max(5, max_delay))
 
     job = ptb_app.job_queue.run_repeating(
         perform_online_action,
